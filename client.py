@@ -12,23 +12,25 @@ from protocol_fsm import (
     TERMINATE,
 )
 
-# Configuration
 HOST = "127.0.0.1"
 PORT = 65432
 
-# Master Keys mapping
+# Expanded Key Store
 KEYS = {
     1: b"masterkey_client1_32bytes_long_!!",
     2: b"masterkey_client2_32bytes_long_!!",
+    3: b"masterkey_client3_32bytes_long_!!",
+    4: b"masterkey_client4_32bytes_long_!!",
 }
 
 
 def run_client(client_id):
     if client_id not in KEYS:
-        print("Invalid Client ID. Use 1 or 2.")
+        print(f"Error: No key found for Client {client_id}")
         return
 
     master_key = KEYS[client_id]
+    # [cite: 83] Client initializes with Master Key
     session = ProtocolSession(client_id, master_key, "client")
 
     try:
@@ -36,62 +38,62 @@ def run_client(client_id):
             s.connect((HOST, PORT))
             print(f"[CLIENT {client_id}] Connected.")
 
-            # --- 1. Handshake ---
-            # Send HELLO
+            # --- 1. Handshake Phase [cite: 114] ---
+            print(f"[CLIENT {client_id}] Sending HELLO...")
+            # Opcode 10
             hello = session.build_message(CLIENT_HELLO, b"HELLO", DIR_C2S)
             s.sendall(hello)
 
-            # Receive CHALLENGE
+            # Expect Challenge (Opcode 20)
             data = s.recv(4096)
             opcode, _ = session.parse_message(data, DIR_S2C)
-            if opcode != SERVER_CHALLENGE:
-                print("[ERROR] Handshake failed")
+
+            if opcode == SERVER_CHALLENGE:
+                print(f"[CLIENT {client_id}] Handshake Successful. Active.")
+            else:
+                print(f"[CLIENT {client_id}] Handshake Failed. Opcode: {opcode}")
                 return
 
-            print(f"[CLIENT {client_id}] Handshake Successful. Phase: {session.phase}")
-
-            # --- 2. Data Transmission Loop ---
-            # We will send 3 rounds of data
-            for i in range(1, 9):
-                # Data values: Client 1 sends 10, 20, 30. Client 2 sends 5, 5, 5.
-                val = 10 * i if client_id == 1 else 10 * (7 - i)
+            # --- 2. Data Transmission Phase [cite: 100] ---
+            # Sending 5 rounds to demonstrate continuous sync
+            for i in range(1, 6):
+                # Unique value calculation for demo
+                val = 10 * client_id
                 payload = str(val).encode()
 
-                print(
-                    f"\n[CLIENT {client_id}] Sending Data: {val} (Round {session.round})"
-                )
+                print(f"[CLIENT {client_id}] Sending: {val} (Round {session.round})")
+
+                # [cite: 60-67] Encrypt & Authenticate
                 msg = session.build_message(CLIENT_DATA, payload, DIR_C2S)
                 s.sendall(msg)
 
-                print(f"[CLIENT {client_id}] Waiting for Server Aggregation...")
+                # Wait for Aggregated Response
                 resp_data = s.recv(4096)
-
-                # Check for server disconnect or error
                 if not resp_data:
+                    print(f"[CLIENT {client_id}] Server disconnected.")
                     break
 
-                opcode, resp_plain = session.parse_message(resp_data, DIR_S2C)
-                if opcode == SERVER_AGGR_RESPONSE:
-                    print(
-                        f"[CLIENT {client_id}] Received Aggregate: {resp_plain.decode()}"
-                    )
+                # [cite: 68-75] Decrypt & Verify
+                opcode, plain = session.parse_message(resp_data, DIR_S2C)
 
-                # Small sleep to make logs readable
+                if opcode == SERVER_AGGR_RESPONSE:
+                    print(f"[CLIENT {client_id}] Round {i} Result: {plain.decode()}")
+
+                # Sleep just to make manual terminal observation easier
                 time.sleep(1)
 
-            # --- 3. Termination ---
+            # --- 3. Termination [cite: 27] ---
+            print(f"[CLIENT {client_id}] Sending TERMINATE.")
             term = session.build_message(TERMINATE, b"BYE", DIR_C2S)
             s.sendall(term)
-            print(f"[CLIENT {client_id}] Session Terminated.")
 
     except Exception as e:
         print(f"[CLIENT {client_id}] Error: {e}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        cid = int(sys.argv[1])
+    if len(sys.argv) != 2:
+        print("Usage: python client.py <client_id>")
+        print("Example: python client.py 1")
     else:
-        cid = int(input("Enter Client ID to run (1 or 2): "))
-
-    run_client(cid)
+        run_client(int(sys.argv[1]))
