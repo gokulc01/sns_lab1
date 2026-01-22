@@ -52,9 +52,9 @@ def run_client(client_id):
 
             # --- 2. Data Transmission Loop ---
             # We will send 3 rounds of data
-            for i in range(1, 4):
+            for i in range(1, 9):
                 # Data values: Client 1 sends 10, 20, 30. Client 2 sends 5, 5, 5.
-                val = 10 * i if client_id == 1 else 5
+                val = 10 * i if client_id == 1 else 10 * (7 - i)
                 payload = str(val).encode()
 
                 print(

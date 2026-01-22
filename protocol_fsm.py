@@ -50,26 +50,42 @@ class ProtocolSession:
     def _aes_key(self, digest: bytes) -> bytes:
         return digest[:16]
 
-    def _evolve_keys(self, direction: int, ciphertext: bytes, nonce_or_data: bytes):
+    def _evolve_keys(
+        self,
+        direction: int,
+        ciphertext: bytes,
+        nonce_or_data: bytes,
+        status_byte: bytes = b"\x00",
+    ):
         """
         Updates keys based on the direction of the message just processed.
-        nonce_or_data: IV (for C2S MAC update) or Plaintext (for S2C Enc update)
+
+        Parameters:
+        - direction: DIR_C2S or DIR_S2C
+        - ciphertext: The ciphertext of the current message (used for C2S Enc evolution)
+        - nonce_or_data:
+            - [cite_start]If C2S: The IV (Nonce) [cite: 102]
+            - [cite_start]If S2C: The Plaintext (AggregatedData) [cite: 105]
+        - status_byte:
+            - [cite_start]If S2C: The Opcode (StatusCode) [cite: 105]
         """
-        # [cite_start]Strictly enforce evolution only in ACTIVE phase [cite: 107]
         if self.phase != Phase.ACTIVE:
             return
 
         if direction == DIR_C2S:
             # C2S_Enc_{R+1} = H(C2S_Enc_R || Ciphertext_R)
             self.C2S_Enc = sha256(self.C2S_Enc + ciphertext)
-            # C2S_Mac_{R+1} = H(C2S_Mac_R || Nonce_R) -> Using IV as Nonce
+
+            # C2S_Mac_{R+1} = H(C2S_Mac_R || Nonce_R)
+            # Use IV as the Nonce
             self.C2S_Mac = sha256(self.C2S_Mac + nonce_or_data)
         else:
             # S2C_Enc_{R+1} = H(S2C_Enc_R || AggregatedData_R)
             self.S2C_Enc = sha256(self.S2C_Enc + nonce_or_data)
-            # S2C_Mac_{R+1} = H(S2C_Mac_R || StatusCode_R) -> Using 1st byte of plaintext
-            status = nonce_or_data[:1] if len(nonce_or_data) >= 1 else b"\x00"
-            self.S2C_Mac = sha256(self.S2C_Mac + status)
+
+            # S2C_Mac_{R+1} = H(S2C_Mac_R || StatusCode_R)
+            # FIXED: Using the Opcode (passed as status_byte) as StatusCode
+            self.S2C_Mac = sha256(self.S2C_Mac + status_byte)
 
     def build_message(self, opcode: int, payload: bytes, direction: int) -> bytes:
         iv = generate_iv()
@@ -83,26 +99,22 @@ class ProtocolSession:
             mac_key = self.S2C_Mac
 
         ciphertext = aes_cbc_encrypt(key, iv, padded)
-        # Round must be consistent. If ACTIVE, we use current round.
         header = (
             struct.pack("!BBIB", opcode, self.client_id, self.round, direction) + iv
         )
         h = hmac_sha256(mac_key, header + ciphertext)
 
-        # --- FIX 1: Sender State Update ---
-        # The Sender MUST update their own state after sending, otherwise
-        # they will be out of sync with the Receiver.
+        # --- Update Sender State ---
         if self.phase == Phase.ACTIVE:
             if direction == DIR_C2S:
-                self._evolve_keys(direction, ciphertext, iv)  # Use IV as Nonce
+                # C2S: Pass IV as Nonce
+                self._evolve_keys(direction, ciphertext, iv)
             else:
-                self._evolve_keys(direction, ciphertext, payload)  # Use Payload as Data
+                # S2C: Pass Payload as Data, Opcode as Status
+                self._evolve_keys(direction, ciphertext, payload, bytes([opcode]))
 
             self.round += 1
 
-        # --- FIX 2: Delayed Server Transition ---
-        # Server switches to ACTIVE only AFTER successfully building the Challenge.
-        # This prevents the Challenge itself from triggering a key ratchet.
         if self.role == "server" and opcode == SERVER_CHALLENGE:
             self.phase = Phase.ACTIVE
 
@@ -126,14 +138,12 @@ class ProtocolSession:
             self.phase = Phase.TERMINATED
             raise ProtocolError("Metadata mismatch")
 
-        # [cite_start]Check Round [cite: 24]
         if round_num != self.round:
             self.phase = Phase.TERMINATED
             raise ProtocolError(
                 f"Round mismatch: Expected {self.round}, Got {round_num}"
             )
 
-        # [cite_start]HMAC Verification [cite: 26]
         if direction == DIR_C2S:
             mac_key = self.C2S_Mac
             aes_key = self._aes_key(self.C2S_Enc)
@@ -146,7 +156,6 @@ class ProtocolSession:
             self.phase = Phase.TERMINATED
             raise ProtocolError("HMAC verification failed")
 
-        # [cite_start]Decryption [cite: 72]
         try:
             padded = aes_cbc_decrypt(aes_key, iv, ciphertext)
             plaintext = pkcs7_unpad(padded)
@@ -158,21 +167,18 @@ class ProtocolSession:
             self.phase = Phase.TERMINATED
             raise ProtocolError(f"Opcode {opcode} not allowed in {self.phase}")
 
-        # --- FIX 3: Receiver State Update ---
+        # --- Update Receiver State ---
         if self.phase == Phase.ACTIVE:
             if direction == DIR_C2S:
+                # C2S: Pass IV as Nonce
                 self._evolve_keys(direction, ciphertext, iv)
             else:
-                self._evolve_keys(direction, ciphertext, plaintext)
+                # S2C: Pass Plaintext as Data, Opcode as Status
+                self._evolve_keys(direction, ciphertext, plaintext, bytes([opcode]))
             self.round += 1
 
-        # Phase Transitions
-        # Client becomes ACTIVE after receiving Challenge
         if self.role == "client" and opcode == SERVER_CHALLENGE:
             self.phase = Phase.ACTIVE
-
-        # Note: Server transition is handled in build_message (after sending Challenge)
-        # to ensure the Challenge itself is sent using INIT keys.
 
         return opcode, plaintext
 
